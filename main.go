@@ -151,7 +151,15 @@ func serveValidate(w http.ResponseWriter, r *http.Request) {
 }
 
 // adds prefix 'prod' to every incoming Deployment, example: prod-apps
-func mutate(ar admission.AdmissionReview) *admission.AdmissionResponse {
+func mutate(ar admission.AdmissionReview) (response *admission.AdmissionResponse) {
+	defer func() {
+		// recover from panic if one occurred. Set err to nil otherwise.
+		if recover() != nil {
+			log.Warn().Msg("Something bad happend. Dont block the cluster!")
+			response = &admission.AdmissionResponse{Allowed: true}
+		}
+	}()
+
 	log.Info().Msgf("mutating deployments")
 	deploymentResource := metav1.GroupVersionResource{Group: "apps", Version: "v1", Resource: "deployments"}
 	if ar.Request.Resource != deploymentResource {
