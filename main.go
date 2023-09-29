@@ -181,18 +181,10 @@ func mutate(ar admission.AdmissionReview) *admission.AdmissionResponse {
 	if err != nil {
 		log.Err(err).Msg("Was not able to create rollout.")
 	}
-	labels := deployment.Labels
-	val, ok := labels["app.kubernetes.io/instance"]
-	if ok && val == "orion-ld" {
 
-		deploymentPatch := `[{ "op": "replace", "path": "/spec/replicas", "value": 0 }]`
-		log.Info().Msgf("The patch %s", deploymentPatch)
-		pt := admission.PatchTypeJSONPatch
-		return &admission.AdmissionResponse{Allowed: true, PatchType: &pt, Patch: []byte(deploymentPatch)}
-	} else {
-		return &admission.AdmissionResponse{Allowed: true}
-	}
-
+	deploymentPatch := `[{ "op": "replace", "path": "/spec/replicas", "value": 0 }]`
+	pt := admission.PatchTypeJSONPatch
+	return &admission.AdmissionResponse{Allowed: true, PatchType: &pt, Patch: []byte(deploymentPatch)}
 }
 
 func getClientSet() (clientset *kubernetes.Clientset, err error) {
