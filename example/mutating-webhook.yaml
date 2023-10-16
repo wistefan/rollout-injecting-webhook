@@ -1,0 +1,28 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: deployment-mutation
+  namespace: example-namespace
+  annotations:
+    cert-manager.io/inject-ca-from: marketplace/webhook-cert
+webhooks:
+  - name: "deployment-mutation.example-namespace.svc"
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: In
+          values: [ "example-namespace" ]
+    rules:
+      - operations: [ "CREATE", "UPDATE"]
+        apiGroups: [ "apps" ]
+        apiVersions: [ "v1" ]
+        resources: [ "deployments" ]
+        scope: "Namespaced"
+    clientConfig:
+      service:
+        namespace: example-namespace
+        name: webhook-server
+        path: "/mutate"
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    timeoutSeconds: 5

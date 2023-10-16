@@ -178,6 +178,12 @@ func mutate(ar admission.AdmissionReview) (response *admission.AdmissionResponse
 		}
 	}
 
+	val, ok := deployment.Annotations["wistefan/rollout-injecting-webhook"]
+	if ok && val == "ignore" {
+		log.Info().Msgf("Rollout injection is disabled for %s.", deployment.Name)
+		return &admission.AdmissionResponse{Allowed: true}
+	}
+
 	clientSet, err := getClientSet()
 	if err != nil {
 		// no mutations if the client fails to not block the cluster
@@ -272,7 +278,7 @@ func createPreviewService(clientSet *kubernetes.Clientset, deployment appsv1.Dep
 	serviceExists := false
 	for _, service := range services.Items {
 		log.Info().Msgf("Service selectors: %s", &service.Spec.Selector)
-		if sameSelectors(service.Spec.Selector, deploymentSelectors) {
+		if containsSelectors(service.Spec.Selector, deploymentSelectors) {
 			originalService = service
 			serviceExists = true
 			break
@@ -305,15 +311,13 @@ func createPreviewService(clientSet *kubernetes.Clientset, deployment appsv1.Dep
 	return originalService.Name, previewService.Name, err
 }
 
-func sameSelectors(m1 map[string]string, m2 map[string]string) bool {
-	if len(m1) != len(m2) {
-		log.Debug().Msgf("Selector maps are not equal. %v vs %v", m1, m2)
-		return false
-	}
-	for k, v := range m1 {
-		val, ok := m2[k]
-		if !ok || v != val {
-			log.Debug().Msgf("Selector maps are not equal. %v vs %v", m1, m2)
+func containsSelectors(contained map[string]string, containingMap map[string]string) bool {
+	for containedKey, containedValue := range contained {
+		val, ok := containingMap[containedKey]
+		if !ok {
+			return false
+		}
+		if containedValue != val {
 			return false
 		}
 	}
