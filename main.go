@@ -2,13 +2,16 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1"
 	"github.com/gookit/goutil/structs"
+	"github.com/procyon-projects/chrono"
 	"github.com/rs/zerolog/log"
 	admission "k8s.io/api/admission/v1"
 	appsv1 "k8s.io/api/apps/v1"
@@ -16,6 +19,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
+	"k8s.io/apimachinery/pkg/types"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	dynamic "k8s.io/client-go/dynamic"
@@ -29,6 +33,7 @@ var (
 	runtimeScheme = runtime.NewScheme()
 	codecFactory  = serializer.NewCodecFactory(runtimeScheme)
 	deserializer  = codecFactory.UniversalDeserializer()
+	taskScheduler = chrono.NewDefaultTaskScheduler()
 )
 
 type MetaData struct {
@@ -150,7 +155,6 @@ func serveValidate(w http.ResponseWriter, r *http.Request) {
 	serve(w, r, AdmitHandler(validate))
 }
 
-// adds prefix 'prod' to every incoming Deployment, example: prod-apps
 func mutate(ar admission.AdmissionReview) (response *admission.AdmissionResponse) {
 	defer func() {
 		// recover from panic if one occurred. Set err to nil otherwise.
@@ -183,22 +187,74 @@ func mutate(ar admission.AdmissionReview) (response *admission.AdmissionResponse
 		log.Info().Msgf("Rollout injection is disabled for %s.", deployment.Name)
 		return &admission.AdmissionResponse{Allowed: true}
 	}
-
 	clientSet, err := getClientSet()
 	if err != nil {
 		// no mutations if the client fails to not block the cluster
 		return &admission.AdmissionResponse{Allowed: true}
 	}
+	err = handleRolloutCreation(deployment, clientSet)
+	if err != nil {
+		scheduleRolloutCreation(deployment, clientSet, 10)
+		return &admission.AdmissionResponse{Allowed: true}
+	}
+
+	deploymentPatch := `[{ "op": "replace", "path": "/spec/replicas", "value": 0 }, {"op": "add", "path": "/metadata/annotations/wistefan~1rollout-injecting-webhook", "value":"managed"}]`
+	pt := admission.PatchTypeJSONPatch
+	return &admission.AdmissionResponse{Allowed: true, PatchType: &pt, Patch: []byte(deploymentPatch)}
+}
+
+func handleRolloutCreation(deployment appsv1.Deployment, clientSet *kubernetes.Clientset) error {
+
+	val, ok := deployment.Annotations["wistefan/rollout-injecting-webhook"]
+	if ok && val == "managed" {
+		log.Debug().Msgf("Rollout already created for deployment %s.", deployment.Name)
+		return nil
+	}
+
 	activeService, previewService, _ := createPreviewService(clientSet, deployment)
+	if activeService == "" {
+		log.Info().Msgf("No service found for %s. Will allow deployment and reschedule the rollout creation.", deployment.Name)
+		return errors.New("no_active_service_found")
+
+	}
 	log.Info().Msgf("Services to use: %s and %s.", activeService, previewService)
-	_, err = createRollout(clientSet, deployment, activeService, previewService)
+	_, err := createRollout(clientSet, deployment, activeService, previewService)
 	if err != nil {
 		log.Err(err).Msg("Was not able to create rollout.")
 	}
+	return err
+}
 
-	deploymentPatch := `[{ "op": "replace", "path": "/spec/replicas", "value": 0 }]`
-	pt := admission.PatchTypeJSONPatch
-	return &admission.AdmissionResponse{Allowed: true, PatchType: &pt, Patch: []byte(deploymentPatch)}
+func scheduleRolloutCreation(deployment appsv1.Deployment, clientSet *kubernetes.Clientset, backoffSeconds int) error {
+	now := time.Now()
+	_, err := taskScheduler.Schedule(func(ctx context.Context) {
+		err := handleRolloutCreation(deployment, clientSet)
+		if err == nil {
+			err = updateDeployment(deployment, clientSet)
+		}
+		if err != nil {
+			log.Warn().Msgf("Was not able to update. Will reschedule the task. Err: %s", err)
+			// if the rollout cannot be created after such long time, it most probably will also not later.
+			if backoffSeconds > 60 {
+				log.Warn().Msgf("Backoff limit reached. Will not reschedule the rollout creation.")
+			} else {
+				scheduleRolloutCreation(deployment, clientSet, backoffSeconds+10)
+			}
+		}
+	}, chrono.WithStartTime(now.Year(), now.Month(), now.Day(), now.Hour(), now.Minute(), now.Second()+backoffSeconds))
+
+	return err
+}
+
+func updateDeployment(deployment appsv1.Deployment, clientSet *kubernetes.Clientset) error {
+	ctx := context.TODO()
+	deploymentClient := clientSet.AppsV1().Deployments(deployment.Namespace)
+
+	deploymentPatch := `[{ "op": "replace", "path": "/spec/replicas", "value": 0 }, {"op": "add", "path": "/metadata/annotations/wistefan~1rollout-injecting-webhook", "value":"managed"}]`
+
+	_, err := deploymentClient.Patch(ctx, deployment.Name, types.JSONPatchType, []byte(deploymentPatch), metav1.PatchOptions{})
+
+	return err
 }
 
 func getClientSet() (clientset *kubernetes.Clientset, err error) {
@@ -273,12 +329,12 @@ func createPreviewService(clientSet *kubernetes.Clientset, deployment appsv1.Dep
 	}
 
 	deploymentSelectors := deployment.Spec.Selector.MatchLabels
-	log.Info().Msgf("Deployment selectors: %s", deploymentSelectors)
+	log.Debug().Msgf("Deployment selectors: %s", deploymentSelectors)
 	var originalService corev1.Service
 	serviceExists := false
 	for _, service := range services.Items {
-		log.Info().Msgf("Service selectors: %s", &service.Spec.Selector)
-		if containsSelectors(service.Spec.Selector, deploymentSelectors) {
+		log.Debug().Msgf("Service selectors: %s", service.Spec.Selector)
+		if containsSelectors(deploymentSelectors, service.Spec.Selector) {
 			originalService = service
 			serviceExists = true
 			break
@@ -313,6 +369,7 @@ func createPreviewService(clientSet *kubernetes.Clientset, deployment appsv1.Dep
 
 func containsSelectors(contained map[string]string, containingMap map[string]string) bool {
 	for containedKey, containedValue := range contained {
+		log.Info().Msgf("Contained key %s and value %s - check in map %s", containedKey, containedValue, containingMap)
 		val, ok := containingMap[containedKey]
 		if !ok {
 			return false
